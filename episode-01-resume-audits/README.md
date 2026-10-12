@@ -17,7 +17,9 @@
 - Résumé-quality analysis (Table 4, Panel B) repeated over 1,000 random splits: White applicants gain more from a better résumé in 98.9% of splits, but the difference is significant in only 55.7%.
 - Name-level noise test: within each race-and-gender group, differences between first names are no larger than chance.
 - Correction-method comparison: Storey q-values flag 23 firms; Benjamini–Hochberg flags 15.
+- Customer-facing test: the race gap is about four times larger in retail and hospitality companies (3.1 vs 0.8 percentage points). See `ep01_customer_test.R`.
 
 ## Files
 - `episode01_replication.Rmd`: the notebook (downloads all data itself; about one minute to run)
 - `episode01_replication.html`: rendered output
+- `ep01_customer_test.R`: compares the race gap in customer-facing companies with all others (runs in seconds)
