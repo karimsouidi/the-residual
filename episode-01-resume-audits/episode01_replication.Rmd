@@ -1,0 +1,248 @@
+---
+title: "The Residual, Episode 1: Replication notebook"
+subtitle: "Bertrand & Mullainathan (2004) and Kline, Rose & Walters (2022)"
+author: "Karim Souidi"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "")
+for (p in c("haven", "sandwich", "lmtest", "knitr", "BiocManager")) {
+  if (!requireNamespace(p, quietly = TRUE))
+    install.packages(p, repos = "https://cloud.r-project.org", quiet = TRUE)
+}
+if (!requireNamespace("qvalue", quietly = TRUE))
+  BiocManager::install("qvalue", update = FALSE, ask = FALSE, quiet = TRUE)
+library(sandwich); library(lmtest); library(knitr)
+suppressMessages(library(qvalue))
+pct <- function(x) sprintf("%.1f%%", 100 * x)
+```
+
+This notebook downloads both public datasets and reproduces every number used in episode 1. Nothing needs to be downloaded by hand.
+
+# Kline, Rose & Walters (2022): Systemic Discrimination Among Large U.S. Employers
+
+83,643 fictitious applications to 108 large U.S. employers, October 2019 to April 2021. Data: Harvard Dataverse [doi:10.7910/DVN/HLO4XC](https://doi.org/10.7910/DVN/HLO4XC) (CC0). Firm identities are masked.
+
+## Data
+
+```{r krw-data}
+base  <- "https://dataverse.harvard.edu/api/access/datafile/"
+f_dat <- tempfile(fileext = ".dta"); f_sic <- tempfile(fileext = ".tab")
+download.file(paste0(base, "6307466?format=original"), f_dat, mode = "wb", quiet = TRUE)
+download.file(paste0(base, "6307294"), f_sic, quiet = TRUE)
+krw <- as.data.frame(haven::zap_labels(haven::read_dta(f_dat)))
+sic <- read.delim(f_sic, fileEncoding = "UTF-8-BOM")
+krw$industry <- sic$sic_name[match(krw$sic_combined, sic$sic_combined)]
+krw$month <- substr(krw$submitted_date, 1, 7)
+```
+
+The sample has **`r format(nrow(krw), big.mark = ",")`** applications to **`r format(length(unique(krw$job_id)), big.mark = ",")`** jobs at **`r length(unique(krw$firm_id))`** firms, using **`r length(unique(krw$firstname))`** first names, sent from `r min(krw$submitted_date)` to `r max(krw$submitted_date)`.
+
+## Headline contact rates (paper's Table 1)
+
+```{r krw-headline}
+w  <- mean(krw$cb[krw$black == 0]); b  <- mean(krw$cb[krw$black == 1])
+fw <- mean(krw$cb[krw$female == 0]); ff <- mean(krw$cb[krw$female == 1])
+data.frame(group = c("White names", "Black names", "Male names", "Female names"),
+           contact_30_days = pct(c(w, b, fw, ff)))
+```
+
+The White-Black gap is **`r round(100 * (w - b), 2)` percentage points**, a ratio of **`r round(w / b, 3)`**. For comparison, Bertrand & Mullainathan (2001-02) found 9.65% vs 6.45%, a ratio of 1.50. The outcome, employers and names differ, so compare with care.
+
+## Main regression (paper's Table 2, column 1)
+
+Linear probability model with the paper's controls; standard errors clustered by job.
+
+```{r krw-regression}
+m <- lm(cb ~ black + female + over40 + political_club + academic_club + lgbtq_club +
+          same_gender_pronouns + gender_neutral_pronouns + associates +
+          factor(wave) + factor(region4), data = krw)
+ct <- coeftest(m, vcov = vcovCL(m, cluster = ~ job_id))
+round(ct[c("black", "female", "over40"), ], 4)
+```
+
+## Firm-level gaps: is discrimination concentrated?
+
+Each job received both White and Black applications, so the cleanest firm gap is the average of job-level (White rate minus Black rate) differences. This removes job-to-job noise in overall contact rates.
+
+```{r krw-firms}
+jb <- do.call(rbind, lapply(split(krw, krw$job_id), function(s) {
+  if (length(unique(s$black)) < 2) return(NULL)
+  data.frame(job_id = s$job_id[1], firm_id = s$firm_id[1], industry = s$industry[1],
+             n = nrow(s), diff = mean(s$cb[s$black == 0]) - mean(s$cb[s$black == 1]))
+}))
+fg <- do.call(rbind, lapply(split(jb, jb$firm_id), function(s)
+  data.frame(firm_id = s$firm_id[1], industry = names(which.max(table(s$industry))),
+             jobs = nrow(s), n = sum(s$n), gap = mean(s$diff),
+             se = sd(s$diff) / sqrt(nrow(s)))))
+fg <- fg[is.finite(fg$se) & fg$se > 0, ]
+
+# Simple normal-normal empirical Bayes: how much of the spread is real?
+v_signal <- max(var(fg$gap) - mean(fg$se^2), 0)
+fg$eb <- mean(fg$gap) + (v_signal / (v_signal + fg$se^2)) * (fg$gap - mean(fg$gap))
+fg$z  <- fg$gap / fg$se
+fg$p1 <- pnorm(-fg$z)
+
+# Share of the total gap contributed by the most-discriminating firms
+fg$contrib <- fg$gap * fg$n
+o   <- fg[order(-fg$eb), ]
+top <- ceiling(0.2 * nrow(o))
+
+data.frame(
+  measure = c("Jobs with both races", "Mean job-level gap (pp)", "Firms",
+              "SD of raw firm gaps (pp)", "Estimated SD of true firm gaps (pp)",
+              "Firms significant at 5%, one-sided, unadjusted",
+              "Firms flagged, Benjamini-Hochberg 5% (normal approx.)",
+              "Share of total gap from top 20% of firms"),
+  value = c(nrow(jb), round(100 * mean(jb$diff), 2), nrow(fg),
+            round(100 * sd(fg$gap), 2), round(100 * sqrt(v_signal), 2),
+            sum(fg$z > 1.645), sum(p.adjust(fg$p1, "BH") < 0.05),
+            pct(sum(o$contrib[1:top]) / sum(fg$contrib))))
+```
+
+The top-20% share ranks firms by noisy estimates, so it likely overstates concentration. Section 3 reproduces the paper's own firm-level test.
+
+Ten firms with the largest shrunken gaps (percentage points):
+
+```{r krw-top10}
+top10 <- transform(head(o, 10)[, c("firm_id", "industry", "jobs")],
+                   raw_gap = round(100 * head(o, 10)$gap, 1),
+                   shrunken = round(100 * head(o, 10)$eb, 1))
+rownames(top10) <- NULL
+top10
+```
+
+## Gap by industry
+
+```{r krw-industry}
+ind <- do.call(rbind, lapply(split(krw, krw$industry), function(s)
+  data.frame(industry = s$industry[1], n = nrow(s),
+             white = round(100 * mean(s$cb[s$black == 0]), 1),
+             black = round(100 * mean(s$cb[s$black == 1]), 1),
+             gap = round(100 * (mean(s$cb[s$black == 0]) - mean(s$cb[s$black == 1])), 2))))
+ind <- ind[order(-ind$gap), ]; rownames(ind) <- NULL
+ind
+```
+
+## Gap over time, through the pandemic
+
+```{r krw-waves}
+wv <- do.call(rbind, lapply(split(krw, krw$wave), function(s)
+  data.frame(wave = s$wave[1], from = min(s$month), to = max(s$month), n = nrow(s),
+             white = round(100 * mean(s$cb[s$black == 0]), 1),
+             black = round(100 * mean(s$cb[s$black == 1]), 1),
+             gap = round(100 * (mean(s$cb[s$black == 0]) - mean(s$cb[s$black == 1])), 2))))
+rownames(wv) <- NULL
+wv
+```
+
+## First names: about 1,100 applications per name
+
+```{r krw-names}
+nm <- do.call(rbind, lapply(split(krw, krw$firstname), function(s)
+  data.frame(name = s$firstname[1], race = s$race[1], gender = s$gender[1],
+             n = nrow(s), rate = mean(s$cb))))
+nm$rate_pct <- round(100 * nm$rate, 1)
+nm_tab <- nm[order(nm$race, nm$gender, -nm$rate), c("race", "gender", "name", "n", "rate_pct")]
+rownames(nm_tab) <- NULL
+nm_tab
+```
+
+Does the name matter beyond race and gender? Compare the spread of name contact rates within each race-gender group with the spread sampling noise alone would produce (percentage points):
+
+```{r krw-names-noise}
+nm$se2 <- nm$rate * (1 - nm$rate) / nm$n
+grp <- paste(nm$race, nm$gender)
+within_var <- tapply(nm$rate, grp, var); noise_var <- tapply(nm$se2, grp, mean)
+round(100 * cbind(observed_sd = sqrt(within_var), noise_sd = sqrt(noise_var)), 2)
+```
+
+# Bertrand & Mullainathan (2004): returns to resume quality
+
+Table 4, Panel B, repeated over 1,000 random splits. Panel B estimates a probit of callback on resume characteristics in a random third of the sample, scores the other two-thirds, and splits them at the median predicted callback. The paper reports one split; this repeats the procedure 1,000 times. This chunk takes about a minute.
+
+```{r bm-data}
+td <- tempfile(); dir.create(td)
+v  <- available.packages(repos = "https://cloud.r-project.org")["AER", "Version"]
+tb <- file.path(td, "aer.tar.gz")
+download.file(paste0("https://cloud.r-project.org/src/contrib/AER_", v, ".tar.gz"), tb, quiet = TRUE)
+untar(tb, files = "AER/data/ResumeNames.rda", exdir = td)
+load(file.path(td, "AER/data/ResumeNames.rda")); bm <- ResumeNames
+bm$call01 <- as.integer(bm$call == "yes"); bm$black <- as.integer(bm$ethnicity == "afam")
+```
+
+```{r bm-splits}
+f_bm <- call01 ~ experience + I(experience^2) + volunteer + military + email + holes + school +
+  honors + computer + special + college + gender + city + wanted +
+  requirements + reqexp + reqcomm + reqeduc + reqcomp + reqorg
+resume_vars <- c("experience", "I(experience^2)", "volunteeryes", "militaryyes", "emailyes",
+                 "holesyes", "schoolyes", "honorsyes", "computeryes", "specialyes", "collegeyes")
+
+one <- function(seed) {
+  set.seed(seed); est <- sample(nrow(bm), round(nrow(bm) / 3))
+  m <- glm(f_bm, family = binomial("probit"), data = bm[est, ])
+  X <- model.matrix(f_bm, bm[-est, ]); r <- bm[-est, ]
+  r$pred <- X[, resume_vars] %*% coef(m)[resume_vars]
+  r$high <- as.integer(r$pred > median(r$pred))
+  g <- function(bl, h) mean(r$call01[r$black == bl & r$high == h])
+  s <- summary(lm(call01 ~ black * high, data = r))$coefficients["black:high", ]
+  pb <- prop.test(c(sum(r$call01[r$black == 1 & r$high == 1]), sum(r$call01[r$black == 1 & r$high == 0])),
+                  c(sum(r$black == 1 & r$high == 1), sum(r$black == 1 & r$high == 0)), correct = FALSE)$p.value
+  c(w_low = g(0, 0), w_high = g(0, 1), b_low = g(1, 0), b_high = g(1, 1),
+    gain_w = g(0, 1) - g(0, 0), gain_b = g(1, 1) - g(1, 0),
+    did = -unname(s[1]), p_int = unname(s[4]), p_gain_b = pb)
+}
+res <- t(sapply(1:1000, one))
+round(100 * apply(res[, 1:7], 2, quantile, c(.05, .5, .95)), 2)
+```
+
+The paper's single split gives a White gain of 6.42 pp and a Black gain of 3.23 pp. Across 1,000 splits (percentiles above, in percentage points):
+
+- White gain exceeds Black gain in **`r pct(mean(res[, "did"] > 0))`** of splits.
+- That difference is significant at 5% in **`r pct(mean(res[, "p_int"] < 0.05))`** of splits (median p-value `r round(median(res[, "p_int"]), 3)`).
+- The Black gain itself is significant at 5% in **`r pct(mean(res[, "p_gain_b"] < 0.05))`** of splits.
+
+The interaction test uses conventional (non-robust) standard errors.
+
+# Kline, Rose & Walters (2022): reproducing the 23 flagged firms
+
+The paper's method: drop pairs sent out of order, compute White and Black contact rates for each job, run a paired one-sided t-test within each firm, then apply Storey q-values at 5%.
+
+```{r krw-flagged}
+k2  <- krw
+key <- paste(k2$job_id, k2$pair)
+napps  <- ave(k2$black, key, FUN = length); nblack <- ave(k2$black, key, FUN = sum)
+k2  <- k2[!(napps == 2 & nblack != 1), ]
+
+jw <- aggregate(cb ~ firm_id + job_id + white, data = k2, FUN = mean)
+wd <- reshape(jw, idvar = c("firm_id", "job_id"), timevar = "white", direction = "wide")
+wd <- wd[complete.cases(wd), ]
+fe <- do.call(rbind, lapply(split(wd, wd$firm_id), function(s) {
+  t1 <- t.test(s$cb.1, s$cb.0, paired = TRUE, alternative = "greater")
+  data.frame(firm_id = s$firm_id[1], est = unname(t1$estimate), p_greater = t1$p.value)
+}))
+q <- qvalue(fe$p_greater, pi0.method = "bootstrap")
+
+data.frame(
+  measure = c("Applications after the paper's drop",
+              "Estimated share of firms that don't discriminate (Storey pi0)",
+              "Firms flagged, Storey q <= 0.05 (paper's method)",
+              "Firms flagged, Benjamini-Hochberg < 0.05"),
+  value = c(format(nrow(k2), big.mark = ","), round(q$pi0, 2), sum(q$qvalues <= 0.05),
+            sum(p.adjust(fe$p_greater, "BH") < 0.05)))
+```
+
+Storey's method estimates how many firms are truly null before correcting; Benjamini-Hochberg assumes all of them could be. With an estimated `r round(100 * q$pi0)`% of firms not discriminating, the correction is lighter and more firms clear the bar.
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
